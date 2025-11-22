@@ -8,7 +8,6 @@ Pillow>=10.0.0
 transformers>=4.30.0
 
 # Optional Dependencies (comment out if not needed)
-face-recognition>=1.3.0  # For MyCropFace, MyFaceEmbedDistance
 qwen-vl-utils>=0.0.1     # For MyQwenImageCaptioningNode, MyFolderFilterNode
 
 # Segmentation models (optional)

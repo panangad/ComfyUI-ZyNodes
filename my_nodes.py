@@ -18,7 +18,6 @@ from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentati
 import comfy.model_management as model_management
 import comfy.utils
 import cv2
-import face_recognition
 import folder_paths
 import numpy as np
 import scipy.ndimage
@@ -462,45 +461,6 @@ class MySegmentMask:
 
 
 
-# ============================================================================
-# ============================================================================
-
-class MyCropFace:
-    CATEGORY = "Custom"
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "my_crop_face"
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "padding": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
-            }
-        }
-
-    def my_crop_face(self, image, padding):
-        image_tensor = image.squeeze(0)
-        image_np = image_tensor.numpy()
-        image_np = (image_np * 255).astype(np.uint8)
-        face_locations = face_recognition.face_locations(image_np)
-        top, right, bottom, left = face_locations[0]
-        width = right - left
-        height = bottom - top
-        side_length = max(width, height)
-        new_side_length = int(side_length * (1 + padding))
-        center_x = (left + right) // 2
-        center_y = (top + bottom - int(side_length * 0.3)) // 2
-        new_left = max(0, center_x - new_side_length // 2)
-        new_right = min(image_np.shape[1], center_x + new_side_length // 2)
-        new_top = max(0, center_y - new_side_length // 2)
-        new_bottom = min(image_np.shape[0], center_y + new_side_length // 2)
-        cropped_image_np = image_np[new_top:new_bottom, new_left:new_right, :]
-        cropped_image_tensor = torch.from_numpy(cropped_image_np)
-        cropped_image_tensor = cropped_image_tensor.to(torch.float32) / 255.0
-        cropped_image_tensor_b = cropped_image_tensor.unsqueeze(0)
-        return (cropped_image_tensor_b,)
-
 
 class MyReplaceHeadNode:
     CATEGORY = "Image Processing"
@@ -556,8 +516,8 @@ class MyFaceEmbedDistance:
         return {
             "required": {
                 "analysis_models": ("ANALYSIS_MODELS",),
-                "ref_folder": ("STRING", {"default": "/home/ubuntu/Gits/apps/kohya_ss/datasets/ref"}),
-                "image_folder": ("STRING", {"default": "/mnt/ramdisk/output/a1"}),
+                "ref_folder": ("STRING", {"default": "ref"}),
+                "image_folder": ("STRING", {"default": "img"}),
                 "similarity_metric": (["L2_norm", "cosine", "euclidean"],),
                 "output_file": ("STRING", {"default": "d2.txt"}),
             }
@@ -741,8 +701,8 @@ class MyFolderFilterNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "input_folder": ("STRING", {"default": "/media/ubuntu/home4/PHOTOS/.logs/Insex. Photo", "multiline": False}),
-                "output_folder": ("STRING", {"default": "/mnt/ramdisk", "multiline": False}),
+                "input_folder": ("STRING", {"default": "folder1", "multiline": False}),
+                "output_folder": ("STRING", {"default": "folder2", "multiline": False}),
                 "command": ("STRING", {"default": "Is there a small green rubber band in this photo?", "multiline": True}),
                 "expected_output": ("STRING", {"default": "Yes", "multiline": False}),
                 "maxl": ("INT", {"default": 100, "min": 1, "max": 100000, "step": 1}),
@@ -814,7 +774,6 @@ NODE_CLASS_MAPPINGS = {
     "MyCleanStringNode": MyCleanStringNode,
     "MyLineSelectorNode": MyLineSelectorNode,
     "MyAppendToTextFileNode": MyAppendToTextFileNode,
-    
     "MyGetLastImage": MyGetLastImage,
     "MyJoinImageLists": MyJoinImageLists,
     "MySaveImage": MySaveImage,
@@ -823,15 +782,11 @@ NODE_CLASS_MAPPINGS = {
     "MyZoomAlign": MyZoomAlign,
     "MyZoomReverse": MyZoomReverse,
     "MyTrim": MyTrim,
-    
     "MyDiffMaskNode": MyDiffMaskNode,
     "MyMarkSubjectNode": MyMarkSubjectNode,
     "MySegmentMask": MySegmentMask,
-    
-    "MyCropFace": MyCropFace,
     "MyReplaceHeadNode": MyReplaceHeadNode,
     "MyFaceEmbedDistance": MyFaceEmbedDistance,
-    
     "MyImageCaptioningNode": MyImageCaptioningNode,
     "MyQwenImageCaptioningNode": MyQwenImageCaptioningNode,
     "MyQwen3Node": MyQwen3Node,
@@ -854,7 +809,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MyDiffMaskNode": "My Diff Mask",
     "MyMarkSubjectNode": "My Mark Subject",
     "MySegmentMask": "My Segment Mask",
-    "MyCropFace": "My Crop Face",
     "MyReplaceHeadNode": "My Replace Head",
     "MyFaceEmbedDistance": "My Face Embeds Distance",
     "MyImageCaptioningNode": "My Image Captioning",
