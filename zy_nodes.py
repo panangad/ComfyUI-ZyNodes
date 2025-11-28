@@ -530,7 +530,8 @@ class ImageAlignNode:
             },
             "optional": {
                 "mask": ("MASK",),
-                "method": (["auto", "orb", "phase", "template"], {"default": "auto"}),
+                "method": (["auto", "orb", "phase", "template", "ecc"], {"default": "auto"}),
+                "max_change_pct": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 50.0, "step": 0.1}),
             },
         }
 
@@ -540,45 +541,105 @@ class ImageAlignNode:
         if arr.max() <= 1.0: return (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
         return np.clip(arr, 0, 255).astype(np.uint8)
 
+    def _preprocess_gray(self, img):
+        """Convert to grayscale with CLAHE for better feature detection in dark areas"""
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+
+    def _filter_black_regions(self, bg_mask, gray, threshold=20):
+        """Exclude near-black pixels from background mask"""
+        return bg_mask & (gray > threshold)
+
     def _analyze_background(self, img1, img2, bg_mask):
         gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-        bg1 = gray1[bg_mask]
+        # Filter out black regions for analysis
+        filtered_mask = self._filter_black_regions(bg_mask, gray1)
+        if filtered_mask.sum() < 100:  # Too few valid pixels
+            return 'ecc'
+        bg1 = gray1[filtered_mask]
         variance = np.var(bg1)
         edges1 = cv2.Canny(gray1, 50, 150)
-        edge_density = edges1[bg_mask].sum() / bg_mask.sum()
-        if variance < 100 or edge_density < 0.01: return 'phase'
+        edge_density = edges1[filtered_mask].sum() / filtered_mask.sum()
+        if variance < 100 or edge_density < 0.01: return 'ecc'
         elif variance < 500 or edge_density < 0.05: return 'template'
         else: return 'orb'
 
     def _align_phase(self, img1, img2, bg_mask):
         try:
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+            gray1 = self._preprocess_gray(img1)
+            gray2 = self._preprocess_gray(img2)
+            # Filter out black regions
+            filtered_mask = self._filter_black_regions(bg_mask, gray1)
+            if filtered_mask.sum() < 100: return None
             bg1, bg2 = gray1.copy(), gray2.copy()
-            bg1[~bg_mask] = 0; bg2[~bg_mask] = 0
+            bg1[~filtered_mask] = 0; bg2[~filtered_mask] = 0
             shift, response = cv2.phaseCorrelate(np.float32(bg1), np.float32(bg2))
-            if response < 0.3: return None
+            if response < 0.2: return None
             H, W = img1.shape[:2]
             return {'scale': 1.0, 'scale_pct': 0.0, 'tx': float(shift[0]), 'ty': float(shift[1]),
                     'tx_pct': float(shift[0]/W*100), 'ty_pct': float(shift[1]/H*100),
                     'confidence': float(response), 'method': 'phase'}
         except: return None
 
+    def _align_ecc(self, img1, img2, bg_mask):
+        """ECC alignment - robust for small transforms with low texture"""
+        try:
+            gray1 = self._preprocess_gray(img1)
+            gray2 = self._preprocess_gray(img2)
+            H, W = gray1.shape
+            # Filter out black regions
+            filtered_mask = self._filter_black_regions(bg_mask, gray1)
+            if filtered_mask.sum() < 100: return None
+            # Apply mask by zeroing out non-background
+            g1, g2 = gray1.copy(), gray2.copy()
+            g1[~filtered_mask] = 0; g2[~filtered_mask] = 0
+            # ECC with Euclidean motion model (translation + rotation + scale)
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-7)
+            try:
+                _, warp = cv2.findTransformECC(np.float32(g1), np.float32(g2), warp_matrix, 
+                                               cv2.MOTION_EUCLIDEAN, criteria)
+            except cv2.error:
+                return None
+            a, b, tx = warp[0]; c, d, ty = warp[1]
+            scale = (np.sqrt(a*a + c*c) + np.sqrt(b*b + d*d)) / 2.0
+            return {'scale': float(scale), 'scale_pct': float((scale-1.0)*100), 
+                    'tx': float(tx), 'ty': float(ty),
+                    'tx_pct': float(tx/W*100), 'ty_pct': float(ty/H*100),
+                    'confidence': 0.8, 'method': 'ecc'}
+        except: return None
+
     def _align_template(self, img1, img2, bg_mask):
         try:
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+            gray1 = self._preprocess_gray(img1)
+            gray2 = self._preprocess_gray(img2)
             H, W = gray1.shape
-            bg_mask_uint8 = (bg_mask * 255).astype(np.uint8)
+            # Filter out black regions and find good template location
+            filtered_mask = self._filter_black_regions(bg_mask, gray1)
+            if filtered_mask.sum() < 100: return None
+            bg_mask_uint8 = (filtered_mask * 255).astype(np.uint8)
             contours, _ = cv2.findContours(bg_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours: return None
             largest = max(contours, key=cv2.contourArea)
             x, y, w, h = cv2.boundingRect(largest)
             template_size = min(w, h, 100)
-            cx, cy = x + w//2, y + h//2
+            # Find point with highest edge density for template center
+            edges = cv2.Canny(gray1, 50, 150)
+            edges[~filtered_mask] = 0
+            best_cx, best_cy, best_edge_sum = x + w//2, y + h//2, 0
             ts = template_size // 2
+            for _ in range(10):  # Sample 10 random positions
+                cx = x + ts + np.random.randint(0, max(1, w - 2*ts))
+                cy = y + ts + np.random.randint(0, max(1, h - 2*ts))
+                if cx-ts<0 or cy-ts<0 or cx+ts>W or cy+ts>H: continue
+                edge_sum = edges[cy-ts:cy+ts, cx-ts:cx+ts].sum()
+                if edge_sum > best_edge_sum:
+                    best_edge_sum, best_cx, best_cy = edge_sum, cx, cy
+            cx, cy = best_cx, best_cy
             if cx-ts<0 or cy-ts<0 or cx+ts>W or cy+ts>H: return None
             template = gray1[cy-ts:cy+ts, cx-ts:cx+ts]
+            if template.std() < 10: return None  # Skip low-contrast templates
             best_score, best_params = -1, None
             for scale in [0.95, 0.97, 0.99, 1.0, 1.01, 1.03, 1.05]:
                 scaled = cv2.resize(gray2, None, fx=scale, fy=scale)
@@ -598,10 +659,13 @@ class ImageAlignNode:
 
     def _align_orb(self, img1, img2, bg_mask):
         try:
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+            gray1 = self._preprocess_gray(img1)
+            gray2 = self._preprocess_gray(img2)
             H, W = gray1.shape
-            orb_mask = (bg_mask * 255).astype(np.uint8)
+            # Filter out black regions
+            filtered_mask = self._filter_black_regions(bg_mask, cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY))
+            if filtered_mask.sum() < 100: return None
+            orb_mask = (filtered_mask * 255).astype(np.uint8)
             orb = cv2.ORB_create(nfeatures=1000)
             kp1, des1 = orb.detectAndCompute(gray1, orb_mask)
             kp2, des2 = orb.detectAndCompute(gray2, orb_mask)
@@ -625,19 +689,23 @@ class ImageAlignNode:
         except: return None
 
     def _select_best(self, results, img1, img2, bg_mask):
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        gray1 = self._preprocess_gray(img1).astype(np.float32)
+        gray2 = self._preprocess_gray(img2).astype(np.float32)
         H, W = gray1.shape
+        # Filter out black regions for comparison
+        filtered_mask = self._filter_black_regions(bg_mask, cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY))
+        if filtered_mask.sum() < 100:
+            filtered_mask = bg_mask
         best_error, best_params = float('inf'), None
         for params in results:
             M = np.array([[params['scale'], 0, params['tx']], [0, params['scale'], params['ty']]], dtype=np.float32)
             warped = cv2.warpAffine(gray2, M, (W, H), flags=cv2.INTER_LINEAR)
-            error = np.mean(np.abs(gray1 - warped)[bg_mask])
+            error = np.mean(np.abs(gray1 - warped)[filtered_mask])
             if error < best_error:
                 best_error, best_params = error, params
         return best_params
 
-    def calculate(self, image1, image2, mask=None, method="auto"):
+    def calculate(self, image1, image2, mask=None, method="auto", max_change_pct=5.0):
         img1 = self._to_numpy(image1[0])
         img2 = self._to_numpy(image2[0])
         H, W = img1.shape[:2]
@@ -652,20 +720,33 @@ class ImageAlignNode:
         results = []
         if method == "auto":
             selected = self._analyze_background(img1, img2, bg_mask)
-            for m in [selected, 'orb', 'phase', 'template']:
+            for m in [selected, 'orb', 'phase', 'template', 'ecc']:
                 if m == 'phase': res = self._align_phase(img1, img2, bg_mask)
                 elif m == 'template': res = self._align_template(img1, img2, bg_mask)
+                elif m == 'ecc': res = self._align_ecc(img1, img2, bg_mask)
                 else: res = self._align_orb(img1, img2, bg_mask)
                 if res is not None and res not in results: results.append(res)
         else:
             if method == 'phase': res = self._align_phase(img1, img2, bg_mask)
             elif method == 'template': res = self._align_template(img1, img2, bg_mask)
+            elif method == 'ecc': res = self._align_ecc(img1, img2, bg_mask)
             else: res = self._align_orb(img1, img2, bg_mask)
             if res is not None: results.append(res)
         
-        if not results: return ({"error": "alignment_failed"}, None)
+        # Filter results by max_change_pct constraint
+        valid_results = [r for r in results if 
+                         abs(r.get('scale_pct', 0)) <= max_change_pct and
+                         abs(r.get('tx_pct', 0)) <= max_change_pct and
+                         abs(r.get('ty_pct', 0)) <= max_change_pct]
         
-        best = self._select_best(results, img1, img2, bg_mask) if len(results) > 1 else results[0]
+        # Fall back to original results if all filtered out, but pick smallest transform
+        if not valid_results and results:
+            results.sort(key=lambda r: abs(r.get('scale_pct', 0)) + abs(r.get('tx_pct', 0)) + abs(r.get('ty_pct', 0)))
+            valid_results = [results[0]]
+        
+        if not valid_results: return ({"error": "alignment_failed"}, None)
+        
+        best = self._select_best(valid_results, img1, img2, bg_mask) if len(valid_results) > 1 else valid_results[0]
         
         M = np.array([[best['scale'], 0, best['tx']], [0, best['scale'], best['ty']]], dtype=np.float32)
         aligned = cv2.warpAffine(img2, M, (W, H), flags=cv2.INTER_LINEAR,
